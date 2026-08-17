@@ -11573,12 +11573,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
+            # Prepare required delivery only after every ordinary response
+            # mutation (reasoning/footer/compression notices/transcript work).
+            # This preserves the PreparedGatewayPayload token through the
+            # remaining send path and prevents later string concatenation from
+            # degrading a governed plan into an ordinary response.
+            from gateway.required_delivery import apply_required_gateway_delivery
+
+            _prepared_delivery = apply_required_gateway_delivery(
+                agent_result,
+                response_text="" if _intentional_silence else response,
+                platform=platform_key,
+                destination_id=str(source.chat_id),
+            )
+            if _prepared_delivery is not None:
+                response = _prepared_delivery
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
             # user/assistant alternation; only the outbound chat delivery is
             # suppressed.
-            if _intentional_silence:
+            if _intentional_silence and _prepared_delivery is None:
                 logger.info(
                     "Suppressing intentional silence marker for session %s",
                     session_entry.session_id,
@@ -11587,7 +11603,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            if (
+                not agent_result.get("required_gateway_delivery")
+                and self._should_send_voice_reply(
+                    event, response, agent_messages, already_sent=_already_sent
+                )
+            ):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -11636,6 +11657,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            # If a governed tool already completed, an exception in later
+            # gateway bookkeeping must not bypass its disclosure with an
+            # ordinary error response.  Render without optional model prose;
+            # malformed/missing renderers produce core's fixed fail-closed
+            # payload.  Errors before any required completion still use the
+            # normal gateway error path below.
+            try:
+                if isinstance(locals().get("agent_result"), dict):
+                    from gateway.required_delivery import (
+                        apply_required_gateway_delivery,
+                    )
+
+                    _error_prepared = apply_required_gateway_delivery(
+                        agent_result,
+                        response_text="",
+                        platform=platform_key,
+                        destination_id=str(source.chat_id),
+                    )
+                    if _error_prepared is not None:
+                        return _error_prepared
+            except Exception:
+                logger.error(
+                    "Required delivery recovery failed during gateway exception"
+                )
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
             # failures). In that path the agent cannot persist the current
@@ -16332,6 +16377,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not isinstance(display_config, dict):
             display_config = {}
 
+        # A registered renderer means this platform can enter a governed turn
+        # only after a tool completes.  Because that status is unknowable at
+        # turn start, buffer all model-authored interim text and token streaming
+        # for the entire turn.  Tool progress/status UI remains independent.
+        try:
+            from gateway.required_delivery import should_suppress_model_interims
+
+            _required_delivery_renderer_active = should_suppress_model_interims(
+                platform_key
+            )
+        except Exception:
+            _required_delivery_renderer_active = True
+
         # Per-platform display settings — resolve via display_config module
         # which checks display.platforms.<platform>.<key> first, then
         # display.<key> global, then built-in platform defaults.
@@ -16391,6 +16449,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
+            and not _required_delivery_renderer_active
             and _resolve_gateway_display_bool(
                 user_config,
                 platform_key,
@@ -17301,6 +17360,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if _required_delivery_renderer_active:
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
@@ -19046,20 +19107,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
                     _previewed = bool(result.get("response_previewed"))
                     first_response = result.get("final_response", "")
+                    # Queue mode has an internal first-response send before the
+                    # outer gateway handler runs.  Apply the same required
+                    # contract here so it cannot bypass trusted disclosure.
+                    from gateway.required_delivery import (
+                        apply_required_gateway_delivery,
+                    )
+
+                    _queued_prepared = apply_required_gateway_delivery(
+                        result,
+                        response_text=first_response,
+                        platform=platform_key,
+                        destination_id=str(source.chat_id),
+                    )
+                    if _queued_prepared is not None:
+                        first_response = _queued_prepared
                     _already_streamed = _stream_confirmed_final_delivery(
                         _sc,
                         first_response,
                         previewed=_previewed,
                     )
+                    if _queued_prepared is not None:
+                        # A raw/model stream can never satisfy this contract.
+                        _already_streamed = False
                     if first_response and not _already_streamed:
                         try:
                             logger.info(
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
+                            await adapter._send_with_retry(
+                                chat_id=source.chat_id,
+                                content=first_response,
                                 metadata=_status_thread_metadata,
                             )
                         except Exception as e:
@@ -19251,7 +19330,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
-        if isinstance(response, dict) and not response.get("failed"):
+        if (
+            isinstance(response, dict)
+            and not response.get("failed")
+            and not _required_delivery_renderer_active
+        ):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
             # response_previewed means the interim_assistant_callback already

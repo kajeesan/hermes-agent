@@ -1123,6 +1123,71 @@ class PluginContext:
         self._manager._hooks.setdefault(hook_name, []).append(callback)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
+    def register_gateway_delivery_renderer(
+        self,
+        renderer_id: str,
+        version: str,
+        callback: Callable,
+        *,
+        platforms: tuple[str, ...] = ("telegram",),
+        required_tool_names: tuple[str, ...] = (),
+    ) -> None:
+        """Register a fail-closed renderer for required gateway deliveries.
+
+        The callback is invoked only with a successful same-turn tool
+        completion captured by core.  It must return the documented
+        ``hermes-gateway-rendered-delivery-v1`` object; exceptions and invalid
+        return values fail closed without model prose. ``required_tool_names``
+        must contain exact observed registry identities (including an MCP
+        ``mcp_<server>_`` prefix); suffix or raw upstream-tool names are not
+        expanded by core.
+        """
+
+        renderer_id = str(renderer_id or "").strip()
+        version = str(version or "").strip()
+        normalized_platforms = frozenset(
+            str(platform or "").strip().lower()
+            for platform in platforms
+            if str(platform or "").strip()
+        )
+        normalized_tool_names = frozenset(
+            str(tool_name or "").strip()
+            for tool_name in required_tool_names
+            if str(tool_name or "").strip()
+        )
+        if not renderer_id:
+            raise ValueError("gateway delivery renderer_id must be non-empty")
+        if not version:
+            raise ValueError("gateway delivery renderer version must be non-empty")
+        if not callable(callback):
+            raise TypeError("gateway delivery renderer callback must be callable")
+        if not normalized_platforms:
+            raise ValueError("gateway delivery renderer requires a platform")
+        if not normalized_tool_names:
+            raise ValueError(
+                "gateway delivery renderer requires required_tool_names"
+            )
+
+        key = (renderer_id, version)
+        if key in self._manager._gateway_delivery_renderers:
+            raise ValueError(
+                f"gateway delivery renderer {renderer_id!r} version {version!r} "
+                "is already registered"
+            )
+        self._manager._gateway_delivery_renderers[key] = {
+            "callback": callback,
+            "platforms": normalized_platforms,
+            "required_tool_names": normalized_tool_names,
+            "plugin": self.manifest.key or self.manifest.name,
+        }
+        logger.debug(
+            "Plugin %s registered gateway delivery renderer: %s@%s (%s)",
+            self.manifest.name,
+            renderer_id,
+            version,
+            ",".join(sorted(normalized_platforms)),
+        )
+
     # -- middleware registration -------------------------------------------
 
     def register_middleware(self, kind: str, callback: Callable) -> None:
@@ -1203,6 +1268,7 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
+        self._gateway_delivery_renderers: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
@@ -1248,6 +1314,7 @@ class PluginManager:
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
+            self._gateway_delivery_renderers.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
             self._cli_commands.clear()
@@ -1885,6 +1952,48 @@ class PluginManager:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
 
+    def get_gateway_delivery_renderer(
+        self,
+        renderer_id: str,
+        version: str,
+        platform: str,
+    ) -> Optional[Callable]:
+        """Return the exact renderer when it declares the target platform."""
+
+        entry = self._gateway_delivery_renderers.get((renderer_id, version))
+        if not entry:
+            return None
+        if str(platform or "").strip().lower() not in entry["platforms"]:
+            return None
+        callback = entry.get("callback")
+        return callback if callable(callback) else None
+
+    def has_gateway_delivery_renderer_for_platform(self, platform: str) -> bool:
+        normalized = str(platform or "").strip().lower()
+        return any(
+            normalized in entry.get("platforms", ())
+            for entry in self._gateway_delivery_renderers.values()
+        )
+
+    def get_gateway_delivery_requirements_for_tool(
+        self, tool_name: str
+    ) -> List[tuple[str, str]]:
+        """Return renderers that declared the exact observed registry name.
+
+        MCP registry names are ``mcp_<server>_<tool>`` and component
+        boundaries are ambiguous when either component contains underscores.
+        Required-delivery plugins therefore register the complete sanitized
+        runtime name.  Core never guesses provenance from a suffix.
+        """
+
+        normalized = str(tool_name or "").strip()
+        matches: List[tuple[str, str]] = []
+        for key, entry in self._gateway_delivery_renderers.items():
+            required_names = entry.get("required_tool_names", ())
+            if normalized in required_names:
+                matches.append(key)
+        return matches
+
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
@@ -2029,6 +2138,32 @@ def has_middleware(kind: str) -> bool:
 def has_hook(hook_name: str) -> bool:
     """Return True when a hook has registered callbacks."""
     return get_plugin_manager().has_hook(hook_name)
+
+
+def get_gateway_delivery_renderer(
+    renderer_id: str,
+    version: str,
+    platform: str,
+) -> Optional[Callable]:
+    """Resolve an exact plugin renderer for a required gateway delivery."""
+
+    return get_plugin_manager().get_gateway_delivery_renderer(
+        renderer_id, version, platform
+    )
+
+
+def has_gateway_delivery_renderer_for_platform(platform: str) -> bool:
+    """Return whether model-authored interim output must be buffered."""
+
+    return get_plugin_manager().has_gateway_delivery_renderer_for_platform(platform)
+
+
+def get_gateway_delivery_requirements_for_tool(
+    tool_name: str,
+) -> List[tuple[str, str]]:
+    """Return required renderer identities declared for a tool completion."""
+
+    return get_plugin_manager().get_gateway_delivery_requirements_for_tool(tool_name)
 
 
 _thread_tool_whitelist = threading.local()

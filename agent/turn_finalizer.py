@@ -425,6 +425,7 @@ def finalize_turn(
         "cost_status": agent.session_cost_status,
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
+        "turn_id": turn_id,
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()

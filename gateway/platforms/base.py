@@ -4088,6 +4088,44 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        _prepared_token = str(
+            getattr(content, "required_delivery_token", "") or ""
+        )
+        if _prepared_token:
+            _metadata_token = (
+                str((metadata or {}).get("required_delivery_token") or "")
+                if isinstance(metadata, dict)
+                else ""
+            )
+            if _metadata_token and _metadata_token != _prepared_token:
+                return SendResult(
+                    success=False,
+                    error="required_delivery_token_mismatch",
+                    retryable=False,
+                )
+            metadata = dict(metadata or {}) if isinstance(metadata, dict) else {}
+            metadata["required_delivery_token"] = _prepared_token
+
+        def _complete_required_delivery_if_sent(send_result: "SendResult") -> None:
+            if not getattr(send_result, "success", False):
+                return
+            try:
+                from gateway.required_delivery import complete_outbound_payload
+
+                complete_outbound_payload(
+                    platform=_platform_name(getattr(self, "platform", None)),
+                    destination_id=str(chat_id),
+                    content=content,
+                    token=(metadata or {}).get("required_delivery_token", "")
+                    if isinstance(metadata, dict)
+                    else "",
+                )
+            except Exception:
+                logger.exception(
+                    "[%s] Required-delivery completion bookkeeping failed",
+                    self.name,
+                )
+
         result = await self.send(
             chat_id=chat_id,
             content=content,
@@ -4096,6 +4134,7 @@ class BasePlatformAdapter(ABC):
         )
 
         if result.success:
+            _complete_required_delivery_if_sent(result)
             return result
 
         error_str = result.error or ""
@@ -4130,6 +4169,7 @@ class BasePlatformAdapter(ABC):
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    _complete_required_delivery_if_sent(result)
                     return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
@@ -4880,6 +4920,7 @@ class BasePlatformAdapter(ABC):
                 response
                 and interrupt_event.is_set()
                 and session_key in self._pending_messages
+                and not getattr(response, "required_delivery_token", "")
             ):
                 logger.info(
                     "[%s] Suppressing stale response for interrupted session %s",
@@ -4890,22 +4931,40 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
+                _required_delivery_token = str(
+                    getattr(response, "required_delivery_token", "") or ""
+                )
+                # The opaque token is created only by core's prepared payload
+                # type.  Keep the governed path active even if state lookup
+                # later fails: Telegram will reject a missing/stale plan before
+                # its first Bot API call instead of degrading to ordinary send.
+                _required_delivery_pending = bool(_required_delivery_token)
+
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
                 # through send_document instead of send_multiple_images. Used
                 # by skills that produce large/lossless images (e.g. info-graph)
                 # where Telegram's sendPhoto recompression destroys legibility.
-                force_document_attachments = "[[as_document]]" in response
+                force_document_attachments = (
+                    not _required_delivery_pending
+                    and "[[as_document]]" in response
+                )
 
                 # Pre-extract snapshot for the #29346 recovery/invariant below.
                 _response_pre_extract = response
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                if _required_delivery_pending:
+                    media_files = []
+                else:
+                    media_files, response = self.extract_media(response)
+                    media_files = self.filter_media_delivery_paths(media_files)
 
                 # Extract image URLs and send them as native platform attachments
-                images, text_content = self.extract_images(response)
+                if _required_delivery_pending:
+                    images, text_content = [], str(response)
+                else:
+                    images, text_content = self.extract_images(response)
                 # Strip any remaining internal directives from message body (fixes #1561).
                 # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
                 # with an unknown extension is intentionally left in the body for
@@ -4915,7 +4974,7 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
                 local_files = []
-                if not is_ephemeral_response:
+                if not is_ephemeral_response and not _required_delivery_pending:
                     # Auto-detect bare local file paths for native media delivery
                     # (helps small models that don't use MEDIA: syntax). Skip
                     # system/command notices so config paths stay visible text
@@ -4948,6 +5007,11 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if _required_delivery_pending:
+                    _final_thread_metadata = dict(_final_thread_metadata or {})
+                    _final_thread_metadata["required_delivery_token"] = (
+                        _required_delivery_token
+                    )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -4957,6 +5021,7 @@ class BasePlatformAdapter(ABC):
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
+                        and not _required_delivery_pending
                         and not media_files):
                     try:
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements

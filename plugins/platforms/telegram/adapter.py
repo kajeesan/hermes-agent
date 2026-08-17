@@ -3257,6 +3257,54 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        # Required-delivery plans are issued by core from a successful
+        # same-turn tool completion.  The opaque token only selects that
+        # in-memory plan; caller metadata never supplies trusted facts.  Check
+        # the full disclosure+prose payload and destination before the first
+        # Bot API call.
+        _metadata_delivery_token = (
+            str((metadata or {}).get("required_delivery_token") or "")
+            if isinstance(metadata, dict)
+            else ""
+        )
+        _payload_delivery_token = str(
+            getattr(content, "required_delivery_token", "") or ""
+        )
+        if (
+            _metadata_delivery_token
+            and _payload_delivery_token
+            and _metadata_delivery_token != _payload_delivery_token
+        ):
+            return SendResult(
+                success=False,
+                error="required_delivery_token_mismatch",
+                retryable=False,
+            )
+        _required_delivery_token = (
+            _payload_delivery_token or _metadata_delivery_token
+        )
+        try:
+            from gateway.required_delivery import validate_outbound_payload
+
+            _required_delivery = validate_outbound_payload(
+                platform="telegram",
+                destination_id=str(chat_id),
+                content=content,
+                token=_required_delivery_token,
+            )
+        except Exception:
+            return SendResult(
+                success=False,
+                error="required_delivery_validation_failed",
+                retryable=False,
+            )
+        if _required_delivery.governed and not _required_delivery.valid:
+            return SendResult(
+                success=False,
+                error="required_delivery_validation_failed",
+                retryable=False,
+            )
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -3264,7 +3312,10 @@ class TelegramAdapter(BasePlatformAdapter):
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if (
+                not _required_delivery.governed
+                and self._should_attempt_rich(content, metadata=metadata)
+            ):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -3281,11 +3332,32 @@ class TelegramAdapter(BasePlatformAdapter):
                                 pass  # Typing failures are non-fatal
                     return rich_result
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
+            # Format and split message if needed.  A governed plan is split by
+            # section first, guaranteeing every trusted-disclosure chunk is
+            # sent before the first optional-prose chunk.  The complete plan
+            # above was validated before either section is formatted or sent.
+            if _required_delivery.governed:
+                _delivery_sections = [
+                    _required_delivery.trusted_disclosure,
+                    _required_delivery.optional_prose,
+                ]
+                chunks = []
+                for _section in _delivery_sections:
+                    if not _section:
+                        continue
+                    _formatted_section = self.format_message(_section)
+                    chunks.extend(
+                        self.truncate_message(
+                            _formatted_section,
+                            self.MAX_MESSAGE_LENGTH,
+                            len_fn=utf16_len,
+                        )
+                    )
+            else:
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
@@ -3554,10 +3626,33 @@ class TelegramAdapter(BasePlatformAdapter):
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(e)
             is_pool_timeout = self._looks_like_pool_timeout(e)
+            _governed_partial_delivery = (
+                _required_delivery.governed
+                and bool(locals().get("message_ids"))
+            )
+            if _governed_partial_delivery:
+                try:
+                    from gateway.required_delivery import invalidate_outbound_payload
+
+                    invalidate_outbound_payload(
+                        platform="telegram",
+                        destination_id=str(chat_id),
+                        content=content,
+                        token=_required_delivery_token,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] Failed to invalidate partial required delivery",
+                        self.name,
+                    )
             return SendResult(
                 success=False,
                 error=str(e),
-                retryable=(is_connect_timeout or is_pool_timeout or not is_timeout),
+                retryable=(
+                    False
+                    if _governed_partial_delivery
+                    else (is_connect_timeout or is_pool_timeout or not is_timeout)
+                ),
                 error_kind=error_kind,
             )
 

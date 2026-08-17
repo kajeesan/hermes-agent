@@ -868,19 +868,54 @@ def _emit_post_tool_call_hook(
 ) -> None:
     """Emit the ``post_tool_call`` observer hook.
 
-    No-ops cheaply when no plugin has registered for ``post_tool_call`` —
-    the ``has_hook`` gate skips both the result-field derivation and the
-    payload dispatch so the no-listener path costs one dict lookup.  When
-    ``status`` is not supplied, the ok/error fields are derived from the
-    result *after* the gate (parsing the result is only worth it when a
-    listener will actually consume it).
+    The required-delivery collector always observes the direct result before
+    any model-visible transform.  The separate plugin observer remains gated
+    by ``has_hook('post_tool_call')``.  When ``status`` is not supplied, the
+    ok/error fields are derived once and shared by both paths.
     """
+    if status is None:
+        status, error_type, error_message = _tool_result_observer_fields(result)
+
+    # Required gateway delivery is sourced from this exact successful tool
+    # completion before any transform_tool_result hook can replace what the
+    # model sees.  The collector binds the event's Hermes session/turn/tool-call
+    # IDs; identity fields inside the tool result are product-domain data and
+    # are never substituted for that binding.
+    try:
+        from gateway.required_delivery import record_successful_tool_completion
+
+        record_successful_tool_completion(
+            tool_name=function_name,
+            result=result,
+            status=status,
+            session_id=session_id or "",
+            turn_id=turn_id or "",
+            tool_call_id=tool_call_id or "",
+            api_request_id=api_request_id or "",
+            task_id=task_id or "",
+        )
+    except Exception as _delivery_err:
+        logger.warning("required gateway delivery collection failed: %s", _delivery_err)
+        try:
+            from gateway.required_delivery import (
+                record_tool_completion_collection_failure,
+            )
+
+            record_tool_completion_collection_failure(
+                tool_name=function_name,
+                session_id=session_id or "",
+                turn_id=turn_id or "",
+                tool_call_id=tool_call_id or "",
+            )
+        except Exception:
+            # A second failure must not expose the tool's raw result.  The
+            # registered-tool invariant is also checked again at turn delivery.
+            logger.error("required gateway delivery failure could not be recorded")
+
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
             return
-        if status is None:
-            status, error_type, error_message = _tool_result_observer_fields(result)
         invoke_hook(
             "post_tool_call",
             tool_name=function_name,
