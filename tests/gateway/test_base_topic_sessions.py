@@ -9,6 +9,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
+from gateway.required_delivery import PreparedGatewayPayload
 from gateway.session import SessionSource, build_session_key
 
 
@@ -191,6 +192,36 @@ class TestBasePlatformTopicSessions:
         event = _make_event("-1001", "17585")
         await adapter._process_message_background(event, build_session_key(event.source))
 
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_governed_post_handler_exception_has_no_ordinary_error_send(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            return PreparedGatewayPayload("DISCLOSURE", "opaque-plan-token")
+
+        async def fail_governed_send(*_args, **_kwargs):
+            raise RuntimeError("synthetic post-handler send failure")
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._send_with_retry = fail_governed_send
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(
+            event, build_session_key(event.source)
+        )
+
+        # The exception path must not replace the governed disclosure with the
+        # ordinary ungoverned "Sorry, I encountered an error" send.
+        assert adapter.sent == []
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),

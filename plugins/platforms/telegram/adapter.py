@@ -3285,11 +3285,27 @@ class TelegramAdapter(BasePlatformAdapter):
             _payload_delivery_token or _metadata_delivery_token
         )
         try:
-            from gateway.required_delivery import validate_outbound_payload
+            from gateway.required_delivery import (
+                destination_topic_id_from_metadata,
+                reserve_outbound_payload,
+            )
 
-            _required_delivery = validate_outbound_payload(
+            _destination_topic_id, _route_error = (
+                destination_topic_id_from_metadata(
+                    platform="telegram", metadata=metadata
+                )
+            )
+            if _required_delivery_token and _route_error:
+                return SendResult(
+                    success=False,
+                    error="required_delivery_destination_unsupported",
+                    retryable=False,
+                )
+
+            _required_delivery = reserve_outbound_payload(
                 platform="telegram",
                 destination_id=str(chat_id),
+                destination_topic_id=_destination_topic_id,
                 content=content,
                 token=_required_delivery_token,
             )
@@ -3305,6 +3321,25 @@ class TelegramAdapter(BasePlatformAdapter):
                 error="required_delivery_validation_failed",
                 retryable=False,
             )
+
+        def _invalidate_governed_delivery() -> None:
+            if not _required_delivery.governed:
+                return
+            try:
+                from gateway.required_delivery import invalidate_outbound_payload
+
+                invalidate_outbound_payload(
+                    platform="telegram",
+                    destination_id=str(chat_id),
+                    destination_topic_id=_destination_topic_id,
+                    content=content,
+                    token=_required_delivery_token,
+                )
+            except Exception:
+                logger.exception(
+                    "[%s] Failed to invalidate attempted required delivery",
+                    self.name,
+                )
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -3332,10 +3367,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                 pass  # Typing failures are non-fatal
                     return rich_result
 
-            # Format and split message if needed.  A governed plan is split by
-            # section first, guaranteeing every trusted-disclosure chunk is
-            # sent before the first optional-prose chunk.  The complete plan
-            # above was validated before either section is formatted or sent.
+            # Format and split message if needed. A governed plan is validated
+            # in full before formatting. Delivery is non-atomic when Telegram
+            # requires multiple messages: trusted-disclosure chunks are sent
+            # first, followed by optional-prose chunks, and a partial failure
+            # invalidates the plan rather than retrying the sequence.
             if _required_delivery.governed:
                 _delivery_sections = [
                     _required_delivery.trusted_disclosure,
@@ -3373,7 +3409,7 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
-            
+
             try:
                 from telegram.error import NetworkError as _NetErr
             except ImportError:
@@ -3415,6 +3451,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     should_thread = self._should_thread_reply(reply_to_source, i)
                 reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
                 if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
+                    _invalidate_governed_delivery()
                     return SendResult(
                         success=False,
                         error=self._dm_topic_missing_anchor_error(),
@@ -3470,7 +3507,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
+                                if _required_delivery.governed:
+                                    # This plan is bound to the exact logical
+                                    # topic. Root-chat fallback would redirect
+                                    # it after the pre-send validation.
+                                    _invalidate_governed_delivery()
+                                    return SendResult(
+                                        success=False,
+                                        error=str(send_err),
+                                        retryable=False,
+                                    )
                                 if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                                    _invalidate_governed_delivery()
                                     return SendResult(
                                         success=False,
                                         error=str(send_err),
@@ -3509,6 +3557,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
                                 if private_dm_topic_send:
+                                    _invalidate_governed_delivery()
                                     return SendResult(
                                         success=False,
                                         error=str(send_err),
@@ -3595,6 +3644,30 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # Typing failures are non-fatal
 
+            if _required_delivery.governed:
+                try:
+                    from gateway.required_delivery import complete_outbound_payload
+
+                    _completed = complete_outbound_payload(
+                        platform="telegram",
+                        destination_id=str(chat_id),
+                        destination_topic_id=_destination_topic_id,
+                        content=content,
+                        token=_required_delivery_token,
+                    )
+                except Exception:
+                    _completed = False
+                    logger.exception(
+                        "[%s] Required-delivery completion bookkeeping failed",
+                        self.name,
+                    )
+                if not _completed:
+                    return SendResult(
+                        success=False,
+                        error="required_delivery_completion_failed",
+                        retryable=False,
+                    )
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -3607,6 +3680,7 @@ class TelegramAdapter(BasePlatformAdapter):
             
         except Exception as e:
             logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
+            _invalidate_governed_delivery()
             err_str = str(e).lower()
             error_kind = classify_send_error(e)
             # Message too long — content exceeded 4096 chars. Return failure so
@@ -3626,31 +3700,13 @@ class TelegramAdapter(BasePlatformAdapter):
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(e)
             is_pool_timeout = self._looks_like_pool_timeout(e)
-            _governed_partial_delivery = (
-                _required_delivery.governed
-                and bool(locals().get("message_ids"))
-            )
-            if _governed_partial_delivery:
-                try:
-                    from gateway.required_delivery import invalidate_outbound_payload
-
-                    invalidate_outbound_payload(
-                        platform="telegram",
-                        destination_id=str(chat_id),
-                        content=content,
-                        token=_required_delivery_token,
-                    )
-                except Exception:
-                    logger.exception(
-                        "[%s] Failed to invalidate partial required delivery",
-                        self.name,
-                    )
+            _governed_attempted_delivery = _required_delivery.governed
             return SendResult(
                 success=False,
                 error=str(e),
                 retryable=(
                     False
-                    if _governed_partial_delivery
+                    if _governed_attempted_delivery
                     else (is_connect_timeout or is_pool_timeout or not is_timeout)
                 ),
                 error_kind=error_kind,

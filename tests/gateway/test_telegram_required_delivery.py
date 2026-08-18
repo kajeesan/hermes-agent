@@ -42,13 +42,13 @@ from gateway.required_delivery import (
 from hermes_cli import plugins as plugin_module
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from plugins.platforms.telegram.adapter import TelegramAdapter
-from telegram.error import BadRequest, NetworkError
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 
 RENDERER_ID = "openhealthatlas-recovery-delivery"
 VERSION = "1.0.0"
 TOOL = "openhealthatlas_recovery_snapshot"
-OBSERVED_TOOL = f"mcp_openhealthatlas_{TOOL}"
+OBSERVED_TOOL = f"mcp_openhealthatlas_fictional_{TOOL}"
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +60,14 @@ def _state(monkeypatch):
     _reset_required_delivery_state_for_tests()
 
 
-def _prepared(manager, *, trusted: str, prose: str, chat_id: str = "123"):
+def _prepared(
+    manager,
+    *,
+    trusted: str,
+    prose: str,
+    chat_id: str = "123",
+    topic_id: str | None = None,
+):
     context = PluginContext(
         PluginManifest(name=RENDERER_ID, key=RENDERER_ID, version=VERSION),
         manager,
@@ -104,6 +111,7 @@ def _prepared(manager, *, trusted: str, prose: str, chat_id: str = "123"):
         response_text=prose,
         platform="telegram",
         destination_id=chat_id,
+        destination_topic_id=topic_id,
     )
 
 
@@ -196,6 +204,54 @@ async def test_retry_before_first_send_then_success_consumes_plan(_state):
 
 
 @pytest.mark.asyncio
+async def test_direct_send_success_consumes_plan_before_return(_state):
+    prepared = _prepared(_state, trusted="DISCLOSURE", prose="")
+    adapter = _adapter()
+    adapter._bot.send_message = AsyncMock(return_value=_message(1))
+    metadata = {
+        "required_delivery_token": prepared.required_delivery_token,
+        "notify": True,
+    }
+
+    delivered = await adapter.send(
+        chat_id="123", content=str(prepared), metadata=metadata
+    )
+    assert delivered.success is True
+    assert adapter._bot.send_message.await_count == 1
+
+    replay = await adapter.send(
+        chat_id="123", content=str(prepared), metadata=metadata
+    )
+    assert replay.success is False
+    assert adapter._bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_first_chunk_timeout_invalidates_plan(_state):
+    prepared = _prepared(_state, trusted="DISCLOSURE", prose="")
+    adapter = _adapter()
+    adapter._bot.send_message = AsyncMock(
+        side_effect=TimedOut("ambiguous Telegram timeout")
+    )
+    metadata = {
+        "required_delivery_token": prepared.required_delivery_token,
+        "notify": True,
+    }
+
+    attempted = await adapter.send(
+        chat_id="123", content=str(prepared), metadata=metadata
+    )
+    assert attempted.success is False
+    assert adapter._bot.send_message.await_count == 1
+
+    replay = await adapter.send(
+        chat_id="123", content=str(prepared), metadata=metadata
+    )
+    assert replay.success is False
+    assert adapter._bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_prepared_token_cannot_be_dropped_into_unguarded_send(_state):
     prepared = _prepared(_state, trusted="DISCLOSURE", prose="PROSE")
     adapter = _adapter()
@@ -250,3 +306,68 @@ async def test_partial_governed_send_is_not_retried_or_plaintext_resent(_state):
     )
     assert replay.success is False
     assert adapter._bot.send_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_topic_redirect_and_conflicting_topic_fields_send_nothing(_state):
+    prepared = _prepared(
+        _state, trusted="DISCLOSURE", prose="", topic_id="77"
+    )
+    adapter = _adapter()
+    adapter._bot.send_message = AsyncMock(return_value=_message(1))
+
+    redirected = await adapter.send(
+        chat_id="123",
+        content=str(prepared),
+        metadata={
+            "required_delivery_token": prepared.required_delivery_token,
+            "thread_id": "78",
+        },
+    )
+    assert redirected.success is False
+    adapter._bot.send_message.assert_not_awaited()
+
+    conflicting = await adapter.send(
+        chat_id="123",
+        content=str(prepared),
+        metadata={
+            "required_delivery_token": prepared.required_delivery_token,
+            "thread_id": "77",
+            "direct_messages_topic_id": "78",
+        },
+    )
+    assert conflicting.success is False
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_governed_topic_failure_never_falls_back_to_root_chat(_state):
+    prepared = _prepared(
+        _state,
+        trusted="DISCLOSURE",
+        prose="",
+        chat_id="-100123",
+        topic_id="77",
+    )
+    adapter = _adapter()
+    adapter._bot.send_message = AsyncMock(
+        side_effect=BadRequest("Message thread not found")
+    )
+
+    result = await adapter._send_with_retry(
+        chat_id="-100123",
+        content=str(prepared),
+        metadata={
+            "required_delivery_token": prepared.required_delivery_token,
+            "thread_id": "77",
+            "notify": True,
+        },
+        base_delay=0,
+    )
+
+    assert result.success is False
+    assert adapter._bot.send_message.await_count >= 1
+    assert all(
+        call.kwargs["message_thread_id"] == 77
+        for call in adapter._bot.send_message.await_args_list
+    )

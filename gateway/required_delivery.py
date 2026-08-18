@@ -73,6 +73,7 @@ class PreparedGatewayPayload(str):
 class _OutboundRecord:
     platform: str
     destination_id: str
+    destination_topic_id: Optional[str]
     payload: str
     payload_sha256: str
     trusted_disclosure: str
@@ -85,10 +86,82 @@ _lock = threading.RLock()
 _completions: dict[tuple[str, str], dict[str, RequiredToolCompletion]] = {}
 _completion_conflicts: set[tuple[str, str]] = set()
 _outbound: dict[str, _OutboundRecord] = {}
+_reserved_outbound: set[str] = set()
 
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _canonical_destination_topic_id(
+    platform: str, destination_topic_id: Any
+) -> tuple[Optional[str], str]:
+    """Canonicalize the bounded topic component of an outbound route.
+
+    Telegram topic identifiers are positive Bot API integers.  Core does not
+    infer a topic from caller/model text, and it does not support any other
+    destination-routing fields for governed delivery.
+    """
+
+    if destination_topic_id is None or destination_topic_id == "":
+        return None, ""
+    if str(platform).lower() != "telegram":
+        return None, "governed topic routing is unsupported for this platform"
+    try:
+        topic_id = int(str(destination_topic_id))
+    except (TypeError, ValueError):
+        return None, "Telegram topic id was not an integer"
+    if topic_id <= 0:
+        return None, "Telegram topic id was not positive"
+    return str(topic_id), ""
+
+
+def destination_topic_id_from_metadata(
+    *, platform: str, metadata: Any
+) -> tuple[Optional[str], str]:
+    """Extract one unambiguous logical topic from adapter routing metadata.
+
+    Only the explicit bounded fields Hermes' Telegram adapter uses are
+    accepted.  Multiple populated fields must identify the same logical topic;
+    arbitrary route dictionaries are not interpreted.
+    """
+
+    if not isinstance(metadata, dict):
+        return None, ""
+    platform_name = str(platform).lower()
+    if platform_name != "telegram":
+        if any(
+            metadata.get(key) not in (None, "")
+            for key in (
+                "thread_id",
+                "message_thread_id",
+                "direct_messages_topic_id",
+                "telegram_direct_messages_topic_id",
+            )
+        ):
+            return None, "governed topic routing is unsupported for this platform"
+        return None, ""
+
+    values = [
+        metadata.get(key)
+        for key in (
+            "thread_id",
+            "message_thread_id",
+            "direct_messages_topic_id",
+            "telegram_direct_messages_topic_id",
+        )
+        if metadata.get(key) not in (None, "")
+    ]
+    canonical: set[str] = set()
+    for value in values:
+        topic_id, error = _canonical_destination_topic_id(platform_name, value)
+        if error:
+            return None, error
+        if topic_id is not None:
+            canonical.add(topic_id)
+    if len(canonical) > 1:
+        return None, "Telegram topic routing fields disagreed"
+    return (next(iter(canonical)) if canonical else None), ""
 
 
 def _prune_locked(now: float) -> None:
@@ -101,6 +174,7 @@ def _prune_locked(now: float) -> None:
     for key, row in list(_outbound.items()):
         if row.created_at < cutoff:
             _outbound.pop(key, None)
+            _reserved_outbound.discard(key)
 
     # Bound memory even if a caller supplies many unique session/turn IDs.
     while len(_completions) > _MAX_RECORDS:
@@ -115,6 +189,7 @@ def _prune_locked(now: float) -> None:
     while len(_outbound) > _MAX_RECORDS:
         oldest = min(_outbound, key=lambda key: _outbound[key].created_at)
         _outbound.pop(oldest, None)
+        _reserved_outbound.discard(oldest)
 
 
 def _parse_json_object(value: Any) -> Optional[dict[str, Any]]:
@@ -320,6 +395,7 @@ def _take_completion(session_id: str, turn_id: str) -> tuple[Optional[RequiredTo
 def _store_outbound(
     platform: str,
     destination_id: str,
+    destination_topic_id: Optional[str],
     payload: str,
     *,
     trusted_disclosure: str,
@@ -330,6 +406,7 @@ def _store_outbound(
     record = _OutboundRecord(
         platform=platform,
         destination_id=str(destination_id),
+        destination_topic_id=destination_topic_id,
         payload=payload,
         payload_sha256=_sha256_text(payload),
         trusted_disclosure=trusted_disclosure,
@@ -340,13 +417,19 @@ def _store_outbound(
     with _lock:
         _prune_locked(now)
         _outbound[token] = record
+        _reserved_outbound.discard(token)
     return PreparedGatewayPayload(payload, token)
 
 
-def _fail_closed(platform: str, destination_id: str) -> PreparedGatewayPayload:
+def _fail_closed(
+    platform: str,
+    destination_id: str,
+    destination_topic_id: Optional[str],
+) -> PreparedGatewayPayload:
     return _store_outbound(
         platform,
         destination_id,
+        destination_topic_id,
         FAIL_CLOSED_TEXT,
         trusted_disclosure=FAIL_CLOSED_TEXT,
         optional_prose="",
@@ -360,21 +443,32 @@ def prepare_gateway_delivery(
     response_text: str,
     platform: str,
     destination_id: str,
+    destination_topic_id: Any = None,
 ) -> Optional[PreparedGatewayPayload]:
     """Render and bind the complete payload for one required completion.
 
     ``None`` means the same turn had no required tool completion.  Any error
     after a required marker was observed returns the fixed fail-closed payload
     and never returns model prose.  ``destination_id`` must be the authenticated
-    source destination from the gateway event.  Core binds it to the opaque
-    outbound plan but deliberately does not disclose it to the renderer.
+    source destination from the gateway event.  For Telegram,
+    ``destination_topic_id`` is the authenticated event's logical topic id.
+    Core binds both to the opaque outbound plan but deliberately discloses
+    neither to the renderer.
     """
 
     completion, completion_error = _take_completion(session_id, turn_id)
     if completion is None and not completion_error:
         return None
+    canonical_topic_id, route_error = _canonical_destination_topic_id(
+        platform, destination_topic_id
+    )
+    if route_error or not str(destination_id):
+        # Return an unregistered token-shaped payload.  Adapter validation then
+        # rejects it before any platform call; unsupported routes must not be
+        # weakened into a root-chat delivery of even the fixed failure text.
+        return PreparedGatewayPayload(FAIL_CLOSED_TEXT, secrets.token_urlsafe(24))
     if completion is None or completion_error or completion.invalid_reason:
-        return _fail_closed(platform, destination_id)
+        return _fail_closed(platform, destination_id, canonical_topic_id)
 
     try:
         from hermes_cli.plugins import get_gateway_delivery_renderer
@@ -385,7 +479,7 @@ def prepare_gateway_delivery(
             platform,
         )
         if renderer is None:
-            return _fail_closed(platform, destination_id)
+            return _fail_closed(platform, destination_id, canonical_topic_id)
         rendered = renderer(
             completion={
                 "tool_name": completion.tool_name,
@@ -400,20 +494,20 @@ def prepare_gateway_delivery(
             platform=platform,
         )
     except Exception:
-        return _fail_closed(platform, destination_id)
+        return _fail_closed(platform, destination_id, canonical_topic_id)
 
     if not isinstance(rendered, dict):
-        return _fail_closed(platform, destination_id)
+        return _fail_closed(platform, destination_id, canonical_topic_id)
     if rendered.get("contract") != RENDERED_DELIVERY_CONTRACT:
-        return _fail_closed(platform, destination_id)
+        return _fail_closed(platform, destination_id, canonical_topic_id)
     if rendered.get("bounded_patterns_checked") is not True:
-        return _fail_closed(platform, destination_id)
+        return _fail_closed(platform, destination_id, canonical_topic_id)
     trusted = rendered.get("trusted_disclosure")
     optional = rendered.get("optional_prose")
     if not isinstance(trusted, str) or not trusted.strip():
-        return _fail_closed(platform, destination_id)
+        return _fail_closed(platform, destination_id, canonical_topic_id)
     if optional is not None and not isinstance(optional, str):
-        return _fail_closed(platform, destination_id)
+        return _fail_closed(platform, destination_id, canonical_topic_id)
 
     trusted = trusted.strip()
     optional = (optional or "").strip()
@@ -423,11 +517,12 @@ def prepare_gateway_delivery(
     # gateway processing send content before or outside the validated text.
     forbidden = ("MEDIA:", "[[as_document]]", "![")
     if any(marker in payload for marker in forbidden):
-        return _fail_closed(platform, destination_id)
+        return _fail_closed(platform, destination_id, canonical_topic_id)
 
     return _store_outbound(
         platform,
         destination_id,
+        canonical_topic_id,
         payload,
         trusted_disclosure=trusted,
         optional_prose=optional,
@@ -440,6 +535,7 @@ def apply_required_gateway_delivery(
     response_text: str,
     platform: str,
     destination_id: str,
+    destination_topic_id: Any = None,
 ) -> Optional[PreparedGatewayPayload]:
     """Prepare a governed payload and make it impossible to skip as streamed.
 
@@ -455,6 +551,7 @@ def apply_required_gateway_delivery(
         response_text=response_text,
         platform=platform,
         destination_id=destination_id,
+        destination_topic_id=destination_topic_id,
     )
     if prepared is None:
         return None
@@ -485,6 +582,7 @@ def validate_outbound_payload(
     *,
     platform: str,
     destination_id: str,
+    destination_topic_id: Any = None,
     content: str,
     token: str,
 ) -> OutboundValidation:
@@ -493,6 +591,7 @@ def validate_outbound_payload(
     with _lock:
         _prune_locked(time.monotonic())
         row = _outbound.get(token) if token else None
+        reserved = token in _reserved_outbound
     if row is None:
         # A token-shaped request is governed even when the plan is stale or
         # already consumed; never degrade it into an ordinary send.
@@ -502,7 +601,22 @@ def validate_outbound_payload(
             token=token,
             error="required delivery plan is missing or expired" if token else "",
         )
-    if row.platform != platform or row.destination_id != str(destination_id):
+    if reserved:
+        return OutboundValidation(
+            governed=True,
+            valid=False,
+            token=token,
+            error="required delivery plan is already reserved",
+        )
+    canonical_topic_id, route_error = _canonical_destination_topic_id(
+        platform, destination_topic_id
+    )
+    if (
+        route_error
+        or row.platform != platform
+        or row.destination_id != str(destination_id)
+        or row.destination_topic_id != canonical_topic_id
+    ):
         return OutboundValidation(
             governed=True,
             valid=False,
@@ -529,10 +643,91 @@ def validate_outbound_payload(
     )
 
 
+def reserve_outbound_payload(
+    *,
+    platform: str,
+    destination_id: str,
+    destination_topic_id: Any = None,
+    content: str,
+    token: str,
+) -> OutboundValidation:
+    """Atomically validate and reserve a plan before the first platform call.
+
+    Reservation closes concurrent and direct-adapter replay.  The platform
+    adapter must complete or invalidate the exact reserved plan before
+    returning; any ambiguous outcome is invalidated rather than made reusable.
+    """
+
+    with _lock:
+        _prune_locked(time.monotonic())
+        row = _outbound.get(token) if token else None
+        if row is None:
+            return OutboundValidation(
+                governed=bool(token),
+                valid=not bool(token),
+                token=token,
+                error=(
+                    "required delivery plan is missing or expired"
+                    if token else ""
+                ),
+            )
+        if token in _reserved_outbound:
+            return OutboundValidation(
+                governed=True,
+                valid=False,
+                token=token,
+                error="required delivery plan is already reserved",
+            )
+        canonical_topic_id, route_error = _canonical_destination_topic_id(
+            platform, destination_topic_id
+        )
+        if (
+            route_error
+            or row.platform != platform
+            or row.destination_id != str(destination_id)
+            or row.destination_topic_id != canonical_topic_id
+        ):
+            return OutboundValidation(
+                governed=True,
+                valid=False,
+                token=token,
+                error=(
+                    "required delivery destination did not match the "
+                    "prepared plan"
+                ),
+            )
+        if not isinstance(content, str):
+            return OutboundValidation(
+                governed=True,
+                valid=False,
+                token=token,
+                error="required payload must be text",
+            )
+        if _sha256_text(content) != row.payload_sha256 or content != row.payload:
+            return OutboundValidation(
+                governed=True,
+                valid=False,
+                token=row.token,
+                error=(
+                    "complete required payload did not match the prepared "
+                    "digest"
+                ),
+            )
+        _reserved_outbound.add(token)
+        return OutboundValidation(
+            governed=True,
+            valid=True,
+            token=row.token,
+            trusted_disclosure=row.trusted_disclosure,
+            optional_prose=row.optional_prose,
+        )
+
+
 def complete_outbound_payload(
     *,
     platform: str,
     destination_id: str,
+    destination_topic_id: Any = None,
     content: str,
     token: str,
 ) -> bool:
@@ -547,9 +742,18 @@ def complete_outbound_payload(
             return False
         if _sha256_text(content) != row.payload_sha256 or content != row.payload:
             return False
-        if row.platform != platform or row.destination_id != str(destination_id):
+        canonical_topic_id, route_error = _canonical_destination_topic_id(
+            platform, destination_topic_id
+        )
+        if (
+            route_error
+            or row.platform != platform
+            or row.destination_id != str(destination_id)
+            or row.destination_topic_id != canonical_topic_id
+        ):
             return False
         _outbound.pop(token, None)
+        _reserved_outbound.discard(token)
         return True
 
 
@@ -557,19 +761,22 @@ def invalidate_outbound_payload(
     *,
     platform: str,
     destination_id: str,
+    destination_topic_id: Any = None,
     content: str,
     token: str,
 ) -> bool:
-    """Invalidate an exact plan after any partial multi-chunk delivery.
+    """Invalidate an exact plan after any attempted governed delivery.
 
-    A partial disclosure cannot be retried safely because Telegram may already
-    have accepted one or more chunks.  Removing the plan makes every fallback,
-    retry, and replay with the old token fail before another Bot API call.
+    An ambiguous first call or partial disclosure cannot be retried safely
+    because Telegram may already have accepted content. Removing the plan
+    makes every fallback, retry, and replay with the old token fail before
+    another Bot API call.
     """
 
     return complete_outbound_payload(
         platform=platform,
         destination_id=destination_id,
+        destination_topic_id=destination_topic_id,
         content=content,
         token=token,
     )
@@ -580,3 +787,4 @@ def _reset_required_delivery_state_for_tests() -> None:
         _completions.clear()
         _completion_conflicts.clear()
         _outbound.clear()
+        _reserved_outbound.clear()

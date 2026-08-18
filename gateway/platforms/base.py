@@ -4106,15 +4106,36 @@ class BasePlatformAdapter(ABC):
             metadata = dict(metadata or {}) if isinstance(metadata, dict) else {}
             metadata["required_delivery_token"] = _prepared_token
 
+        _governed_send = bool(
+            _prepared_token
+            or (
+                isinstance(metadata, dict)
+                and metadata.get("required_delivery_token")
+            )
+        )
+
         def _complete_required_delivery_if_sent(send_result: "SendResult") -> None:
             if not getattr(send_result, "success", False):
                 return
             try:
-                from gateway.required_delivery import complete_outbound_payload
+                from gateway.required_delivery import (
+                    complete_outbound_payload,
+                    destination_topic_id_from_metadata,
+                )
+
+                _destination_topic_id, _route_error = (
+                    destination_topic_id_from_metadata(
+                        platform=_platform_name(getattr(self, "platform", None)),
+                        metadata=metadata,
+                    )
+                )
+                if _route_error:
+                    raise ValueError(_route_error)
 
                 complete_outbound_payload(
                     platform=_platform_name(getattr(self, "platform", None)),
                     destination_id=str(chat_id),
+                    destination_topic_id=_destination_topic_id,
                     content=content,
                     token=(metadata or {}).get("required_delivery_token", "")
                     if isinstance(metadata, dict)
@@ -4135,6 +4156,12 @@ class BasePlatformAdapter(ABC):
 
         if result.success:
             _complete_required_delivery_if_sent(result)
+            return result
+
+        # A governed adapter reserves the exact plan before its first platform
+        # call and invalidates any failed or ambiguous attempt. Base must not
+        # retry, rewrite, or notify through another send path with that token.
+        if _governed_send:
             return result
 
         error_str = result.error or ""
@@ -4892,11 +4919,17 @@ class BasePlatformAdapter(ABC):
                 typing_task,
             )
         
+        _required_delivery_token = ""
+        _required_delivery_pending = False
         try:
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            _required_delivery_token = str(
+                getattr(response, "required_delivery_token", "") or ""
+            )
+            _required_delivery_pending = bool(_required_delivery_token)
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -4931,15 +4964,10 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
-                _required_delivery_token = str(
-                    getattr(response, "required_delivery_token", "") or ""
-                )
                 # The opaque token is created only by core's prepared payload
                 # type.  Keep the governed path active even if state lookup
                 # later fails: Telegram will reject a missing/stale plan before
                 # its first Bot API call instead of degrading to ordinary send.
-                _required_delivery_pending = bool(_required_delivery_token)
-
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
                 # through send_document instead of send_multiple_images. Used
@@ -5275,6 +5303,13 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            if _required_delivery_pending:
+                logger.error(
+                    "[%s] Suppressing ordinary error fallback after a governed "
+                    "delivery was prepared",
+                    self.name,
+                )
+                return
             # Send the error to the user so they aren't left with radio silence
             try:
                 error_type = type(e).__name__

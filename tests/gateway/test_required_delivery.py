@@ -26,8 +26,8 @@ RENDERER_ID = "openhealthatlas-recovery-delivery"
 RENDERER_VERSION = "1.0.0"
 SNAPSHOT_TOOL = "openhealthatlas_recovery_snapshot"
 DETAIL_TOOL = "openhealthatlas_recovery_detail"
-SNAPSHOT_OBSERVED = f"mcp_openhealthatlas_{SNAPSHOT_TOOL}"
-DETAIL_OBSERVED = f"mcp_openhealthatlas_{DETAIL_TOOL}"
+SNAPSHOT_OBSERVED = f"mcp_openhealthatlas_fictional_{SNAPSHOT_TOOL}"
+DETAIL_OBSERVED = f"mcp_openhealthatlas_fictional_{DETAIL_TOOL}"
 
 
 @pytest.fixture(autouse=True)
@@ -413,6 +413,67 @@ def test_payload_digest_destination_and_double_send_are_fail_closed(
     )
     assert replay.governed is True
     assert replay.valid is False
+
+
+def test_telegram_topic_is_part_of_destination_binding(
+    _isolated_required_delivery,
+):
+    _register(
+        _isolated_required_delivery,
+        lambda **_: {
+            "contract": RENDERED_DELIVERY_CONTRACT,
+            "trusted_disclosure": "DISCLOSURE",
+            "optional_prose": "",
+            "bounded_patterns_checked": True,
+        },
+    )
+    _record(_product_result())
+    prepared = prepare_gateway_delivery(
+        session_id="session-1",
+        turn_id="hermes-turn-1",
+        response_text="",
+        platform="telegram",
+        destination_id="chat-1",
+        destination_topic_id="77",
+    )
+
+    assert not validate_outbound_payload(
+        platform="telegram",
+        destination_id="chat-1",
+        destination_topic_id="78",
+        content=str(prepared),
+        token=prepared.required_delivery_token,
+    ).valid
+    assert validate_outbound_payload(
+        platform="telegram",
+        destination_id="chat-1",
+        destination_topic_id=77,
+        content=str(prepared),
+        token=prepared.required_delivery_token,
+    ).valid
+
+
+def test_unsupported_telegram_topic_route_is_fail_closed_before_send(
+    _isolated_required_delivery,
+):
+    _register(_isolated_required_delivery, lambda **_: {})
+    _record(_product_result())
+    prepared = prepare_gateway_delivery(
+        session_id="session-1",
+        turn_id="hermes-turn-1",
+        response_text="model prose",
+        platform="telegram",
+        destination_id="chat-1",
+        destination_topic_id="not-a-topic",
+    )
+
+    assert str(prepared) == FAIL_CLOSED_TEXT
+    assert not validate_outbound_payload(
+        platform="telegram",
+        destination_id="chat-1",
+        content=str(prepared),
+        token=prepared.required_delivery_token,
+    ).valid
 
 
 def test_registered_telegram_renderer_suppresses_whole_turn_model_interims(

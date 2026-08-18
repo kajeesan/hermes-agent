@@ -11583,8 +11583,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _prepared_delivery = apply_required_gateway_delivery(
                 agent_result,
                 response_text="" if _intentional_silence else response,
-                platform=platform_key,
+                platform=_platform_config_key(source.platform),
                 destination_id=str(source.chat_id),
+                destination_topic_id=source.thread_id,
             )
             if _prepared_delivery is not None:
                 response = _prepared_delivery
@@ -11672,8 +11673,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _error_prepared = apply_required_gateway_delivery(
                         agent_result,
                         response_text="",
-                        platform=platform_key,
+                        platform=_platform_config_key(source.platform),
                         destination_id=str(source.chat_id),
+                        destination_topic_id=source.thread_id,
                     )
                     if _error_prepared is not None:
                         return _error_prepared
@@ -19119,6 +19121,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         response_text=first_response,
                         platform=platform_key,
                         destination_id=str(source.chat_id),
+                        destination_topic_id=source.thread_id,
                     )
                     if _queued_prepared is not None:
                         first_response = _queued_prepared
