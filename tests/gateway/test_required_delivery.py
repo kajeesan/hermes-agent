@@ -147,6 +147,82 @@ def test_actual_mcp_completion_is_bound_to_hermes_turn_not_product_turn(
     assert validation.optional_prose == "Optional Hermes explanation."
 
 
+def test_tool_call_bridge_preserves_required_delivery_turn_binding(
+    _isolated_required_delivery,
+    monkeypatch,
+):
+    """The real deferred-MCP bridge must not orphan the governed completion."""
+
+    import model_tools
+    from tools import tool_search as tool_search_module
+
+    observed = {}
+
+    def renderer(**kwargs):
+        observed.update(kwargs)
+        return {
+            "contract": RENDERED_DELIVERY_CONTRACT,
+            "trusted_disclosure": "COMPACT TRUSTED DISCLOSURE",
+            "optional_prose": "Hermes interpretation\n\nBounded explanation.",
+            "bounded_patterns_checked": True,
+        }
+
+    _register(_isolated_required_delivery, renderer)
+    monkeypatch.setattr(
+        tool_search_module,
+        "is_deferrable_tool_name",
+        lambda name: name == SNAPSHOT_OBSERVED,
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_: [{
+            "type": "function",
+            "function": {
+                "name": SNAPSHOT_OBSERVED,
+                "description": "Bounded fictional Recovery snapshot",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+    )
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda name, args, **_: _mcp_completion_wrapper(_product_result()),
+    )
+
+    result = model_tools.handle_function_call(
+        function_name="tool_call",
+        function_args={"name": SNAPSHOT_OBSERVED, "arguments": {}},
+        task_id="task-bridge",
+        session_id="session-bridge",
+        turn_id="turn-bridge",
+        tool_call_id="call-bridge",
+        api_request_id="request-bridge",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+    assert json.loads(result)["structuredContent"]["delivery_contract"][
+        "required"
+    ] is True
+
+    prepared = prepare_gateway_delivery(
+        session_id="session-bridge",
+        turn_id="turn-bridge",
+        response_text="Bounded explanation.",
+        platform="telegram",
+        destination_id="chat-bridge",
+    )
+
+    assert str(prepared).startswith("COMPACT TRUSTED DISCLOSURE\n\n")
+    assert "Hermes interpretation" in str(prepared)
+    assert observed["completion"]["session_id"] == "session-bridge"
+    assert observed["completion"]["turn_id"] == "turn-bridge"
+    assert observed["completion"]["tool_call_id"] == "call-bridge"
+    assert observed["completion"]["api_request_id"] == "request-bridge"
+    assert observed["completion"]["tool_name"] == SNAPSHOT_OBSERVED
+
+
 def test_registered_governed_tool_without_marker_fails_closed(
     _isolated_required_delivery,
 ):

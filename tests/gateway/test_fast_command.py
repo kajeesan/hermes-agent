@@ -43,6 +43,18 @@ class _CapturingAgent:
             "messages": [],
             "api_calls": 1,
             "completed": True,
+            "turn_id": "turn-live",
+        }
+
+
+class _EmptyCapturingAgent(_CapturingAgent):
+    def run_conversation(self, *args, **kwargs):
+        return {
+            "final_response": "",
+            "messages": [],
+            "api_calls": 1,
+            "completed": True,
+            "turn_id": "turn-empty",
         }
 
 
@@ -191,5 +203,50 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     )
 
     assert result["final_response"] == "ok"
+    assert result["turn_id"] == "turn-live"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
     assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_empty_response_preserves_turn_id(monkeypatch, tmp_path):
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _EmptyCapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda user_config, platform_key: {"core"},
+    )
+
+    result = await runner._run_agent(
+        message="hi",
+        context_prompt="",
+        history=[],
+        source=_make_source(),
+        session_id="session-empty",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["session_id"] == "session-empty"
+    assert result["turn_id"] == "turn-empty"

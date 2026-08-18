@@ -18349,6 +18349,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "history_offset": _effective_history_offset,
                     "compacted_in_place": _compacted_in_place,
                     "session_id": effective_session_id,
+                    "turn_id": result.get("turn_id"),
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
@@ -18455,6 +18456,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "model": _resolved_model,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
+                "turn_id": result.get("turn_id"),
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
                 # Pass through the agent_persisted flag so the persistence block
