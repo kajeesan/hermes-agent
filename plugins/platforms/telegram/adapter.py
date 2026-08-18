@@ -2909,6 +2909,14 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            # Optional root-owned tap-first health action bridge.  It shares
+            # this gateway's one Telegram update stream; never start a second
+            # poller for the same bot token.
+            try:
+                from plugins.platforms.telegram.health_actions import register as _register_health_actions
+                _register_health_actions(self, self._app)
+            except Exception as exc:
+                logger.warning("[%s] Health action bridge unavailable: %s", self.name, exc)
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -5073,6 +5081,13 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Registered health/accountability actions (hx:<token>:<action>) ---
+        if data.startswith("hx:"):
+            from plugins.platforms.telegram.health_actions import handle_callback
+
+            await handle_callback(self, update)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):
