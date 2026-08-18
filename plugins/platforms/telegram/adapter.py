@@ -3594,11 +3594,27 @@ class TelegramAdapter(BasePlatformAdapter):
                         # (httpx pool exhausted) is explicitly "not sent to
                         # Telegram" -- retrying through the loop is safe and
                         # prevents silent drops when the pool frees up.
+                        #
+                        # Governed delivery is stricter: any NetworkError that
+                        # is not positively identified as one of those
+                        # pre-dispatch failures is delivery-ambiguous. It must
+                        # escape this inner loop after the first Bot API call
+                        # so the plan is invalidated and cannot duplicate its
+                        # trusted disclosure. Explicit Bot API rejections
+                        # (Markdown parsing and flood control) are handled by
+                        # their separate bounded branches.
+                        is_connect_timeout = self._looks_like_connect_timeout(send_err)
                         is_pool_timeout = self._looks_like_pool_timeout(send_err)
+                        if (
+                            _required_delivery.governed
+                            and not is_connect_timeout
+                            and not is_pool_timeout
+                        ):
+                            raise
                         if (
                             _TimedOut
                             and isinstance(send_err, _TimedOut)
-                            and not self._looks_like_connect_timeout(send_err)
+                            and not is_connect_timeout
                             and not is_pool_timeout
                         ):
                             raise

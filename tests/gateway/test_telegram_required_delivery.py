@@ -178,11 +178,11 @@ async def test_mismatched_complete_payload_sends_nothing(_state):
 
 
 @pytest.mark.asyncio
-async def test_retry_before_first_send_then_success_consumes_plan(_state):
+async def test_ambiguous_network_error_invalidates_plan_without_retry(_state):
     prepared = _prepared(_state, trusted="DISCLOSURE", prose="")
     adapter = _adapter()
     adapter._bot.send_message = AsyncMock(
-        side_effect=[NetworkError("connection dropped"), _message(1)]
+        side_effect=NetworkError("connection dropped")
     )
     metadata = {
         "required_delivery_token": prepared.required_delivery_token,
@@ -192,8 +192,9 @@ async def test_retry_before_first_send_then_success_consumes_plan(_state):
         result = await adapter._send_with_retry(
             chat_id="123", content=str(prepared), metadata=metadata, base_delay=0
         )
-    assert result.success is True
-    assert adapter._bot.send_message.await_count == 2
+    assert result.success is False
+    assert result.retryable is False
+    assert adapter._bot.send_message.await_count == 1
 
     before = adapter._bot.send_message.await_count
     replay = await adapter.send(
