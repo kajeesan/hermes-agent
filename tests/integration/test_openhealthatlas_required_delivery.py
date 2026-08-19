@@ -442,10 +442,10 @@ def test_generic_query_obligation_final_evidence_and_renderer(
     monkeypatch.setattr(plugin_module, "_plugin_manager", manager)
     _reset_required_delivery_state_for_tests()
     assert manager.get_gateway_delivery_requirements_for_tool(GENERIC_QUERY_TOOL) == [
-        ("openhealthatlas-generic-evidence-delivery", "1.0.0")
+        ("openhealthatlas-generic-evidence-delivery", "1.0.1")
     ]
     assert manager.get_gateway_delivery_requirements_for_tool(GENERIC_EVIDENCE_TOOL) == [
-        ("openhealthatlas-generic-evidence-delivery", "1.0.0")
+        ("openhealthatlas-generic-evidence-delivery", "1.0.1")
     ]
 
     _emit(
@@ -478,7 +478,7 @@ def test_generic_query_obligation_final_evidence_and_renderer(
     assert "Deterministic result" in str(prepared)
     assert "sleep.duration_hours" in str(prepared)
     assert "nutrition.logged.protein_g" in str(prepared)
-    assert "Hermes interpretation\n" in str(prepared)
+    assert "Hermes interpretation (model-generated" in str(prepared)
 
 
 @pytest.mark.asyncio
