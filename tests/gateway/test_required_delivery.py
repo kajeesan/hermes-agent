@@ -28,6 +28,11 @@ SNAPSHOT_TOOL = "openhealthatlas_recovery_snapshot"
 DETAIL_TOOL = "openhealthatlas_recovery_detail"
 SNAPSHOT_OBSERVED = f"mcp_openhealthatlas_fictional_{SNAPSHOT_TOOL}"
 DETAIL_OBSERVED = f"mcp_openhealthatlas_fictional_{DETAIL_TOOL}"
+GENERIC_RENDERER_ID = "openhealthatlas-generic-evidence-delivery"
+GENERIC_CATALOG = "mcp_openhealthatlas_fictional_openhealthatlas_health_catalog"
+GENERIC_QUERY = "mcp_openhealthatlas_fictional_openhealthatlas_health_query"
+GENERIC_ANALYZE = "mcp_openhealthatlas_fictional_openhealthatlas_health_analyze"
+GENERIC_EVIDENCE = "mcp_openhealthatlas_fictional_openhealthatlas_health_evidence"
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +102,113 @@ def _record(payload, *, session="session-1", turn="hermes-turn-1", call="call-1"
         api_request_id=f"{turn}:api:1",
         task_id="task-1",
     )
+
+
+def _register_generic(manager: PluginManager, callback):
+    context = PluginContext(
+        PluginManifest(
+            name=GENERIC_RENDERER_ID,
+            key=GENERIC_RENDERER_ID,
+            version="1.0.0",
+        ),
+        manager,
+    )
+    context.register_gateway_delivery_renderer(
+        GENERIC_RENDERER_ID,
+        "1.0.0",
+        callback,
+        platforms=("telegram",),
+        required_tool_names=(
+            GENERIC_CATALOG, GENERIC_QUERY, GENERIC_ANALYZE, GENERIC_EVIDENCE,
+        ),
+    )
+
+
+def _generic_product_result(tool_name: str, role: str) -> dict:
+    return {
+        "contract": "openhealthatlas-hermes-surface-v1",
+        "operation": tool_name.removeprefix("mcp_openhealthatlas_fictional_openhealthatlas_"),
+        "delivery_contract": {
+            "contract": REQUIRED_DELIVERY_CONTRACT,
+            "required": True,
+            "renderer_id": GENERIC_RENDERER_ID,
+            "renderer_version": "1.0.0",
+            "completion_role": role,
+            "final_tool_name": GENERIC_EVIDENCE,
+        },
+    }
+
+
+def _record_generic(
+    tool_name: str,
+    role: str,
+    *,
+    call: str,
+    session: str = "generic-session",
+    turn: str = "generic-turn",
+) -> bool:
+    return record_successful_tool_completion(
+        tool_name=tool_name,
+        result=_mcp_completion_wrapper(_generic_product_result(tool_name, role)),
+        status="ok",
+        session_id=session,
+        turn_id=turn,
+        tool_call_id=call,
+    )
+
+
+def test_generic_intermediate_tool_requires_final_evidence_or_fails_closed(
+    _isolated_required_delivery,
+):
+    _register_generic(
+        _isolated_required_delivery,
+        lambda **_: pytest.fail("intermediate completion must not render"),
+    )
+    assert _record_generic(GENERIC_QUERY, "requires_final", call="query-1")
+
+    prepared = prepare_gateway_delivery(
+        session_id="generic-session",
+        turn_id="generic-turn",
+        response_text="ungoverned model prose",
+        platform="telegram",
+        destination_id="chat-generic",
+    )
+
+    assert str(prepared) == FAIL_CLOSED_TEXT
+    assert "ungoverned model prose" not in str(prepared)
+
+
+def test_generic_final_evidence_supersedes_same_renderer_obligations(
+    _isolated_required_delivery,
+):
+    observed = {}
+
+    def renderer(**kwargs):
+        observed.update(kwargs)
+        return {
+            "contract": RENDERED_DELIVERY_CONTRACT,
+            "trusted_disclosure": "GENERIC DISCLOSURE",
+            "optional_prose": "Hermes interpretation\nBounded explanation.",
+            "bounded_patterns_checked": True,
+        }
+
+    _register_generic(_isolated_required_delivery, renderer)
+    assert _record_generic(GENERIC_CATALOG, "requires_final", call="catalog-1")
+    assert _record_generic(GENERIC_QUERY, "requires_final", call="query-1")
+    assert _record_generic(GENERIC_ANALYZE, "requires_final", call="analyze-1")
+    assert _record_generic(GENERIC_EVIDENCE, "final", call="evidence-1")
+
+    prepared = prepare_gateway_delivery(
+        session_id="generic-session",
+        turn_id="generic-turn",
+        response_text="Bounded explanation.",
+        platform="telegram",
+        destination_id="chat-generic",
+    )
+
+    assert str(prepared).startswith("GENERIC DISCLOSURE\n\n")
+    assert observed["completion"]["tool_name"] == GENERIC_EVIDENCE
+    assert observed["completion"]["tool_call_id"] == "evidence-1"
 
 
 def test_actual_mcp_completion_is_bound_to_hermes_turn_not_product_turn(

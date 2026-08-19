@@ -93,6 +93,22 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _completion_role(result: Any) -> tuple[str, str]:
+    """Return the optional generic required-delivery sequencing marker."""
+
+    if not isinstance(result, dict):
+        return "", ""
+    marker = result.get("delivery_contract")
+    if not isinstance(marker, dict):
+        return "", ""
+    role = marker.get("completion_role")
+    final_tool = marker.get("final_tool_name")
+    return (
+        role if isinstance(role, str) else "",
+        final_tool if isinstance(final_tool, str) else "",
+    )
+
+
 def _canonical_destination_topic_id(
     platform: str, destination_topic_id: Any
 ) -> tuple[Optional[str], str]:
@@ -311,6 +327,17 @@ def record_successful_tool_completion(
     if not tool_call_id:
         invalid_reasons.append("missing tool_call_id")
 
+    completion_role, final_tool_name = _completion_role(product_result)
+    if completion_role or final_tool_name:
+        if completion_role not in {"requires_final", "final"}:
+            invalid_reasons.append("invalid completion_role")
+        if not final_tool_name:
+            invalid_reasons.append("missing final_tool_name")
+        if completion_role == "requires_final":
+            invalid_reasons.append("final required completion not observed")
+        if completion_role == "final" and final_tool_name != tool_name:
+            invalid_reasons.append("final completion tool did not match final_tool_name")
+
     # A normal gateway completion always supplies all three bindings.  When a
     # binding is absent, retain the marker under the available session/turn so
     # finalization fails closed rather than treating the result as ungoverned.
@@ -332,6 +359,20 @@ def record_successful_tool_completion(
     with _lock:
         _prune_locked(row.recorded_at)
         bucket = _completions.setdefault(key, {})
+        if completion_role == "final" and final_tool_name == tool_name:
+            # Intermediate governed tools make omission of the final evidence
+            # call fail closed.  The exact final completion supersedes only
+            # matching obligations from this renderer in the same turn; it
+            # never hides unrelated governed completions or conflicts.
+            for prior_key, prior_row in list(bucket.items()):
+                prior_role, prior_final_tool = _completion_role(prior_row.result)
+                if (
+                    prior_role == "requires_final"
+                    and prior_final_tool == tool_name
+                    and prior_row.renderer_id == row.renderer_id
+                    and prior_row.renderer_version == row.renderer_version
+                ):
+                    bucket.pop(prior_key, None)
         prior = bucket.get(call_key)
         if prior is not None and prior != row:
             _completion_conflicts.add(key)

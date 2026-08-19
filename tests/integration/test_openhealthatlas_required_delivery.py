@@ -66,6 +66,8 @@ from plugins.platforms.telegram.adapter import TelegramAdapter
 # suffix inference or nearby alias is accepted by the delivery plugin.
 SNAPSHOT_TOOL = "mcp_openhealthatlas_fictional_openhealthatlas_recovery_snapshot"
 DETAIL_TOOL = "mcp_openhealthatlas_fictional_openhealthatlas_recovery_detail"
+GENERIC_QUERY_TOOL = "mcp_openhealthatlas_fictional_openhealthatlas_health_query"
+GENERIC_EVIDENCE_TOOL = "mcp_openhealthatlas_fictional_openhealthatlas_health_evidence"
 NON_FICTIONAL_ALIAS = "mcp_openhealthatlas_openhealthatlas_recovery_snapshot"
 RAW_CANARY = "SECRET RAW FICTIONAL SORENESS TEXT"
 CHAT_ID = "-100424242"
@@ -375,6 +377,108 @@ def _assert_private_absent(serialized: str, private_values: set[str]) -> None:
     assert RAW_CANARY not in serialized
     for value in private_values:
         assert value not in serialized
+
+
+def test_generic_query_obligation_final_evidence_and_renderer(
+    tmp_path, monkeypatch,
+):
+    oha = _oha_root()
+    database = tmp_path / "generic-fictional.db"
+    generated = subprocess.run(
+        [
+            sys.executable,
+            str(oha / "scripts" / "make_demo_db.py"),
+            "--output",
+            str(database),
+            "--anchor-date",
+            ANCHOR,
+        ],
+        cwd=oha,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(generated.stdout)["data_class"] == "fictional"
+    config = _tool_config(
+        oha=oha,
+        tmp_path=tmp_path,
+        database=database,
+        sidecar=tmp_path / "unused-sidecar.json",
+    )
+    config["readiness_fixture_lane"] = "development-v6"
+    config["readiness_ancestry_sidecar"] = None
+    namespace, stage, receipt_paths = _load_production_mcp(
+        oha=oha, tmp_path=tmp_path, monkeypatch=monkeypatch, config=config,
+    )
+    monkeypatch.setenv("OPENHEALTHATLAS_SOURCE_TEST", "1")
+    monkeypatch.setenv("OPENHEALTHATLAS_TEST_CONFIG", str(stage / "tool-config.json"))
+    before = _measurement(database)
+
+    query = namespace["openhealthatlas_health_query"](
+        ["sleep.duration_hours", "nutrition.logged.protein_g"],
+        {"from": "2026-06-01", "to": ANCHOR},
+        "summary",
+    )
+    evidence = namespace["openhealthatlas_health_evidence"](
+        [query["evidence_refs"][0]], "summary",
+    )
+    assert _measurement(database) == before
+    assert _sqlite_companions(database) == []
+    assert all(not path.exists() for path in receipt_paths)
+    assert query["delivery_contract"]["completion_role"] == "requires_final"
+    assert evidence["delivery_contract"]["completion_role"] == "final"
+    assert evidence["coverage"]["verified_references"] == 1
+
+    manager = PluginManager()
+    manifest = PluginManifest(
+        name="openhealthatlas-recovery-delivery",
+        key="openhealthatlas-recovery-delivery",
+        version="1.0.0",
+        source="user",
+        path=str(oha / "deploy" / "hermes-openhealthatlas-delivery-plugin"),
+    )
+    manager._load_plugin(manifest)
+    assert manager._plugins[manifest.key].enabled is True
+    monkeypatch.setattr(plugin_module, "_plugin_manager", manager)
+    _reset_required_delivery_state_for_tests()
+    assert manager.get_gateway_delivery_requirements_for_tool(GENERIC_QUERY_TOOL) == [
+        ("openhealthatlas-generic-evidence-delivery", "1.0.0")
+    ]
+    assert manager.get_gateway_delivery_requirements_for_tool(GENERIC_EVIDENCE_TOOL) == [
+        ("openhealthatlas-generic-evidence-delivery", "1.0.0")
+    ]
+
+    _emit(
+        query,
+        session="generic-session",
+        turn="generic-turn",
+        call="query-call",
+        tool=GENERIC_QUERY_TOOL,
+    )
+    _emit(
+        evidence,
+        session="generic-session",
+        turn="generic-turn",
+        call="evidence-call",
+        tool=GENERIC_EVIDENCE_TOOL,
+    )
+    prepared = prepare_gateway_delivery(
+        session_id="generic-session",
+        turn_id="generic-turn",
+        response_text=(
+            "Deterministic result\nThe bounded fictional sleep and nutrition "
+            "summaries are available for interpretation."
+        ),
+        platform="telegram",
+        destination_id=CHAT_ID,
+        destination_topic_id=TOPIC_ID,
+    )
+    assert prepared is not None
+    assert str(prepared).startswith("Data & evidence disclosure\n")
+    assert "Deterministic result" in str(prepared)
+    assert "sleep.duration_hours" in str(prepared)
+    assert "nutrition.logged.protein_g" in str(prepared)
+    assert "Hermes interpretation\n" in str(prepared)
 
 
 @pytest.mark.asyncio
